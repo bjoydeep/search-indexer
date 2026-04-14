@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"regexp"
 	"testing"
+	"time"
 
 	"github.com/driftprogramming/pgxpoolmock"
 	"github.com/golang/mock/gomock"
@@ -20,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 )
 
@@ -46,8 +48,14 @@ func fakeDynamicClient() *fake.FakeDynamicClient {
 
 	scheme.AddKnownTypeWithName(schema.GroupVersionKind{Group: "cluster.open-cluster-management.io", Version: "v1", Kind: "ManagedCluster"},
 		&unstructured.UnstructuredList{})
+	scheme.AddKnownTypeWithName(schema.GroupVersionKind{Group: "cluster.open-cluster-management.io", Version: "v1", Kind: "ManagedClusterList"},
+		&unstructured.UnstructuredList{})
 
 	scheme.AddKnownTypes(schema.GroupVersionResource{Group: "clusters-open-cluster-management.io", Version: "v1", Resource: "managedclusters"}.GroupVersion(),
+		&unstructured.UnstructuredList{})
+	scheme.AddKnownTypeWithName(schema.GroupVersionKind{Group: "internal.open-cluster-management.io", Version: "v1beta1", Kind: "ManagedClusterInfoList"},
+		&unstructured.UnstructuredList{})
+	scheme.AddKnownTypeWithName(schema.GroupVersionKind{Group: "addon.open-cluster-management.io", Version: "v1alpha1", Kind: "ManagedClusterAddOnList"},
 		&unstructured.UnstructuredList{})
 
 	dyn := fake.NewSimpleDynamicClient(scheme,
@@ -230,7 +238,9 @@ func Test_ProcessClusterDeleteOnMC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("an error '%s' was not expected when opening a stub database connection", err)
 	}
-	defer mockConn.Close(context.Background())
+	defer func(mockConn pgxmock.PgxConnIface, ctx context.Context) {
+		_ = mockConn.Close(ctx)
+	}(mockConn, context.Background())
 	mockPool.EXPECT().BeginTx(context.Background(), pgx.TxOptions{}).Return(mockConn, nil)
 	mockConn.ExpectExec(regexp.QuoteMeta(`DELETE FROM "search"."resources" WHERE (("cluster" = 'name-foo') AND ("uid" != 'cluster__name-foo'))`)).WillReturnResult(pgxmock.NewResult("DELETE", 1))
 	mockConn.ExpectExec(regexp.QuoteMeta(`DELETE FROM "search"."edges" WHERE ("cluster" = 'name-foo')`)).WillReturnResult(pgxmock.NewResult("DELETE", 1))
@@ -266,7 +276,9 @@ func Test_ProcessClusterDeleteOnMCASearch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("an error '%s' was not expected when opening a stub database connection", err)
 	}
-	defer mockConn.Close(context.Background())
+	defer func(mockConn pgxmock.PgxConnIface, ctx context.Context) {
+		_ = mockConn.Close(ctx)
+	}(mockConn, context.Background())
 	mockPool.EXPECT().BeginTx(context.Background(), pgx.TxOptions{}).Return(mockConn, nil)
 	mockConn.ExpectExec(regexp.QuoteMeta(`DELETE FROM "search"."resources" WHERE (("cluster" = 'name-foo') AND ("uid" != 'cluster__name-foo'))`)).WillReturnResult(pgxmock.NewResult("DELETE", 1))
 	mockConn.ExpectExec(regexp.QuoteMeta(`DELETE FROM "search"."edges" WHERE ("cluster" = 'name-foo')`)).WillReturnResult(pgxmock.NewResult("DELETE", 1))
@@ -340,7 +352,9 @@ func Test_DeleteStaleClustersResources(t *testing.T) {
 		t.Errorf("an error '%s' was not expected when opening a stub database connection", err)
 	}
 
-	defer mockConn.Close(context.Background())
+	defer func(mockConn pgxmock.PgxConnIface, ctx context.Context) {
+		_ = mockConn.Close(ctx)
+	}(mockConn, context.Background())
 	mockPool.EXPECT().BeginTx(context.Background(), pgx.TxOptions{}).Return(mockConn, nil)
 	mockConn.ExpectExec(regexp.QuoteMeta(`DELETE FROM "search"."resources" WHERE (("cluster" = 'name-foo') AND ("uid" != 'cluster__name-foo'))`)).WillReturnResult(pgxmock.NewResult("DELETE", 1))
 	mockConn.ExpectExec(regexp.QuoteMeta(`DELETE FROM "search"."edges" WHERE ("cluster" = 'name-foo')`)).WillReturnResult(pgxmock.NewResult("DELETE", 1))
@@ -371,7 +385,6 @@ func Test_DeleteStaleClustersResources(t *testing.T) {
 
 	//ensure that the remaining clusters are deleted from db
 	for _, c := range mc {
-		fmt.Println(c)
 		if c != "remaining-managed-foo" {
 			t.Errorf("Remaining cluster does not match. Expected: remaining-managed-foo Got: %s", c)
 		}
@@ -380,6 +393,32 @@ func Test_DeleteStaleClustersResources(t *testing.T) {
 		AssertEqual(t, ok, false, "existingClustersCache should not have an entry for cluster foo")
 	}
 
+}
+
+// [AI] Test that stopAndStartInformer exits promptly when context is canceled
+func Test_stopAndStartInformer_ContextCanceled(t *testing.T) {
+	// Create a context that we'll cancel immediately
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel immediately
+
+	// Create a nil informer (it won't be used since context is already canceled)
+	var informer cache.SharedIndexInformer
+
+	// Start the function in a goroutine
+	done := make(chan bool)
+	go func() {
+		stopAndStartInformer(ctx, "test.group/v1", informer)
+		done <- true
+	}()
+
+	// Wait for the function to exit (with timeout)
+	// Since context is already canceled, it should exit immediately
+	select {
+	case <-done:
+		// Success - function exited when it detected the canceled context
+	case <-time.After(10 * time.Millisecond):
+		t.Error("stopAndStartInformer did not exit within timeout after context cancellation")
+	}
 }
 
 // Mock database outage:
@@ -418,7 +457,9 @@ func Test_DeleteStaleClustersResources_DB_Outage(t *testing.T) {
 		t.Errorf("an error '%s' was not expected when opening a stub database connection", err)
 	}
 
-	defer mockConn.Close(context.Background())
+	defer func(mockConn pgxmock.PgxConnIface, ctx context.Context) {
+		_ = mockConn.Close(ctx)
+	}(mockConn, context.Background())
 	mockPool.EXPECT().BeginTx(context.Background(), pgx.TxOptions{}).Return(mockConn, fakeErr).Times(1).Return(mockConn, nil).Times(1) // return mock error
 	mockConn.ExpectExec(regexp.QuoteMeta(`DELETE FROM "search"."resources" WHERE (("cluster" = 'name-foo') AND ("uid" != 'cluster__name-foo'))`)).WillReturnResult(pgxmock.NewResult("DELETE", 1))
 	mockConn.ExpectExec(regexp.QuoteMeta(`DELETE FROM "search"."edges" WHERE ("cluster" = 'name-foo')`)).WillReturnResult(pgxmock.NewResult("DELETE", 1))
@@ -449,4 +490,100 @@ func Test_DeleteStaleClustersResources_DB_Outage(t *testing.T) {
 		AssertEqual(t, ok, false, "existingClustersCache should not have an entry for cluster foo")
 	}
 
+}
+
+// [AI] Test that syncClusters properly exits when context is canceled
+func Test_syncClusters_ContextCanceled(t *testing.T) {
+	// Suppress log output for cleaner test output
+	restore := supressConsoleOutput()
+	defer restore()
+
+	initializeVars()
+
+	// Set up the mock infrastructure
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mockPool := pgxpoolmock.NewMockPgxPool(ctrl)
+	dao = database.NewDAO(mockPool)
+	dynamicClient = fakeDynamicClient()
+
+	// Mock the deleteStaleClusterResources call
+	columns := []string{"cluster"}
+	pgxRows := pgxpoolmock.NewRows(columns).ToPgxRows()
+	mockPool.EXPECT().Query(gomock.Any(),
+		gomock.Eq(`SELECT DISTINCT "cluster" FROM "search"."resources" WHERE ((data ? '_hubClusterResource') IS FALSE)`),
+		gomock.Eq([]interface{}{}),
+	).Return(pgxRows, nil).AnyTimes()
+
+	// Mock the upsert operations that will be triggered by informers processing existing resources
+	// Allow any Query calls for checking existing resources
+	mockPool.EXPECT().Query(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+	// Allow any Exec calls for upserting clusters
+	mockPool.EXPECT().Exec(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+
+	// Create a context with a short timeout to ensure syncClusters exits
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	// Start syncClusters in a goroutine
+	done := make(chan bool)
+	go func() {
+		syncClusters(ctx)
+		done <- true
+	}()
+
+	// Wait for the function to exit (with a reasonable timeout)
+	select {
+	case <-done:
+		// Success - function exited when context was canceled
+	case <-time.After(500 * time.Millisecond):
+		t.Error("syncClusters did not exit within timeout after context cancellation")
+	}
+}
+
+// [AI]Test that syncClusters handles errors during deleteStaleClusterResources
+func Test_syncClusters_DeleteStaleError(t *testing.T) {
+	// Suppress log output for cleaner test output
+	restore := supressConsoleOutput()
+	defer restore()
+
+	initializeVars()
+
+	// Set up the mock infrastructure
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mockPool := pgxpoolmock.NewMockPgxPool(ctrl)
+	dao = database.NewDAO(mockPool)
+	dynamicClient = fakeDynamicClient()
+
+	// Mock the deleteStaleClusterResources call to return an error
+	mockPool.EXPECT().Query(gomock.Any(),
+		gomock.Eq(`SELECT DISTINCT "cluster" FROM "search"."resources" WHERE ((data ? '_hubClusterResource') IS FALSE)`),
+		gomock.Eq([]interface{}{}),
+	).Return(nil, errors.New("database connection error")).AnyTimes()
+
+	// Mock the upsert operations that will be triggered by informers processing existing resources
+	// Allow any Query calls for checking existing resources
+	mockPool.EXPECT().Query(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+	// Allow any Exec calls for upserting clusters
+	mockPool.EXPECT().Exec(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+
+	// Create a context with a short timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	// Start syncClusters in a goroutine - it should handle the error gracefully
+	done := make(chan bool)
+	go func() {
+		syncClusters(ctx)
+		done <- true
+	}()
+
+	// Wait for the function to exit (with a reasonable timeout)
+	select {
+	case <-done:
+		// Success - function handled the error and exited when context was canceled
+	case <-time.After(500 * time.Millisecond):
+		t.Error("syncClusters did not exit within timeout after error in deleteStaleClusterResources")
+	}
 }
